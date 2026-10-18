@@ -4,7 +4,7 @@ from pathlib import Path
 
 
 def load_csv(file_path: str | Path) -> list[dict[str, str]]:
-    """Load a CSV file and validate its headers."""
+    """Load a CSV file and validate its headers and rows."""
     path = Path(file_path)
 
     if not path.is_file():
@@ -16,18 +16,31 @@ def load_csv(file_path: str | Path) -> list[dict[str, str]]:
         if not reader.fieldnames:
             raise ValueError(f"CSV has no header: {path}")
 
-        if any(not name.strip() for name in reader.fieldnames):
+        # Normalize header whitespace.
+        headers = [name.strip() for name in reader.fieldnames]
+
+        if any(not name for name in headers):
             raise ValueError(f"CSV has an empty column name: {path}")
 
-        if len(reader.fieldnames) != len(set(reader.fieldnames)):
-            raise ValueError(f"CSV has duplicate column names: {path}")
+        # Reject duplicate names, including names duplicated after trimming.
+        if len(headers) != len(set(headers)):
+            raise ValueError(
+                f"CSV has duplicate column names after trimming: {path}"
+            )
 
+        reader.fieldnames = headers
         rows = list(reader)
 
+        # Reject rows containing more values than the header.
         if any(None in row for row in rows):
             raise ValueError(f"CSV contains a row with extra columns: {path}")
 
-        if any(value is None for row in rows for value in row.values()):
+        # Reject rows with fewer values than the header.
+        if any(
+            value is None
+            for row in rows
+            for value in row.values()
+        ):
             raise ValueError(f"CSV contains a row with missing values: {path}")
 
         return rows
@@ -54,13 +67,14 @@ def deduplicate_by_source_id(
     rows: list[dict[str, str]],
 ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     """
-    Deduplicate identical records by source_record_id.
+    Deduplicate records by source_record_id.
 
     Returns:
         (unique_rows, conflicts)
 
-    Repeated IDs with different content are reported as conflicts.
-    They are not silently accepted as valid records.
+    Identical records with the same source ID are counted once.
+    Records with missing IDs or conflicting content are reported
+    in conflicts and are not silently accepted.
     """
     unique_by_id: dict[str, dict[str, str]] = {}
     conflicts: list[dict[str, str]] = []
@@ -75,27 +89,34 @@ def deduplicate_by_source_id(
             })
             continue
 
+        # Normalize the ID in the record used for comparison.
+        normalized_row = row.copy()
+        normalized_row["source_record_id"] = source_id
+
         existing = unique_by_id.get(source_id)
 
         if existing is None:
-            unique_by_id[source_id] = row.copy()
-        elif existing != row:
+            unique_by_id[source_id] = normalized_row
+
+        elif existing != normalized_row:
             conflicts.append({
                 "reason": "conflicting_source_record_id",
                 "source_record_id": source_id,
                 "first_record": repr(existing),
-                "conflicting_record": repr(row),
+                "conflicting_record": repr(normalized_row),
             })
-        # Identical records with the same ID are safely ignored.
+
+        # Exact repeated records with the same ID are safely ignored.
 
     return list(unique_by_id.values()), conflicts
+
 
 def deduplicate_rows(
     rows: list[dict[str, str]],
 ) -> list[dict[str, str]]:
-    """Backward-compatible helper for exact duplicate rows."""
-    unique_rows = []
-    seen = set()
+    """Remove exact duplicate rows while preserving their original order."""
+    unique_rows: list[dict[str, str]] = []
+    seen: set[tuple[tuple[str, str], ...]] = set()
 
     for row in rows:
         fingerprint = tuple(sorted(row.items()))

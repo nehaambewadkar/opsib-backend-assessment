@@ -1,10 +1,41 @@
 
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db.models import ExceptionRecord, TaskRecord
+
+
+def _required_text(data: dict, field: str) -> str:
+    """Return a required, non-empty string field."""
+    value = data.get(field)
+
+    if value is None:
+        raise ValueError(f"{field} cannot be empty.")
+
+    result = str(value).strip()
+
+    if not result:
+        raise ValueError(f"{field} cannot be empty.")
+
+    return result
+
+
+def _decimal_value(data: dict, field: str) -> Decimal:
+    """Convert a value to a finite Decimal."""
+    try:
+        value = Decimal(str(data[field]))
+    except (KeyError, InvalidOperation, TypeError, ValueError):
+        raise ValueError(f"{field} must be a valid number.") from None
+
+    if not value.is_finite():
+        raise ValueError(f"{field} must be a finite number.")
+
+    if value < 0:
+        raise ValueError(f"{field} cannot be negative.")
+
+    return value
 
 
 def persist_exception_and_task(
@@ -13,12 +44,16 @@ def persist_exception_and_task(
     assignment: dict[str, str],
 ) -> tuple[ExceptionRecord, TaskRecord]:
     """
-    Save an exception and its task.
+    Persist an exception and its associated task.
 
-    The caller controls the database transaction and should commit
-    only after the surrounding ingestion operation succeeds.
+    The caller controls the transaction and must commit only after
+    the complete ingestion operation succeeds.
+
+    Existing task status is preserved on repeated pipeline runs.
+    Assignment changes are not automatically written to audit history
+    by this function.
     """
-    required_exception_fields = {
+    required_fields = {
         "exception_key",
         "po_number",
         "line_number",
@@ -31,23 +66,39 @@ def persist_exception_and_task(
         "reason",
     }
 
-    missing = required_exception_fields - exception_data.keys()
+    missing = required_fields - exception_data.keys()
+
     if missing:
         raise ValueError(
             f"Missing exception fields: {', '.join(sorted(missing))}"
         )
 
-    exception_key = str(exception_data["exception_key"]).strip()
-    if not exception_key:
-        raise ValueError("exception_key cannot be empty.")
+    exception_key = _required_text(exception_data, "exception_key")
+    po_number = _required_text(exception_data, "po_number")
+    line_number = _required_text(exception_data, "line_number")
+    location_id = _required_text(exception_data, "location_id")
+    product_id = _required_text(exception_data, "product_id")
+    base_uom = _required_text(exception_data, "base_uom")
+    reason = _required_text(exception_data, "reason")
 
-    shortfall_qty = Decimal(str(exception_data["shortfall_qty"]))
-    if not shortfall_qty.is_finite() or shortfall_qty <= 0:
-        raise ValueError("An exception must have a positive shortfall quantity.")
+    ordered_qty = _decimal_value(exception_data, "ordered_qty")
+    accepted_qty = _decimal_value(exception_data, "accepted_qty")
+    shortfall_qty = _decimal_value(exception_data, "shortfall_qty")
 
-    assignee_id = assignment.get("assignee_id", "").strip() or None
-    assignee_role = assignment.get("assignee_role", "").strip() or None
-    assignment_reason = assignment.get("assignment_reason", "").strip()
+    if shortfall_qty <= 0:
+        raise ValueError(
+            "An exception must have a positive shortfall quantity."
+        )
+
+    assignee_id = (
+        str(assignment.get("assignee_id") or "").strip() or None
+    )
+    assignee_role = (
+        str(assignment.get("assignee_role") or "").strip() or None
+    )
+    assignment_reason = str(
+        assignment.get("assignment_reason") or ""
+    ).strip()
 
     if not assignment_reason:
         raise ValueError("assignment_reason cannot be empty.")
@@ -61,25 +112,30 @@ def persist_exception_and_task(
     if exception is None:
         exception = ExceptionRecord(
             exception_key=exception_key,
-            po_number=str(exception_data["po_number"]).strip(),
-            line_number=str(exception_data["line_number"]).strip(),
-            location_id=str(exception_data["location_id"]).strip(),
-            product_id=str(exception_data["product_id"]).strip(),
-            ordered_qty=Decimal(str(exception_data["ordered_qty"])),
-            accepted_qty=Decimal(str(exception_data["accepted_qty"])),
+            po_number=po_number,
+            line_number=line_number,
+            location_id=location_id,
+            product_id=product_id,
+            ordered_qty=ordered_qty,
+            accepted_qty=accepted_qty,
             shortfall_qty=shortfall_qty,
-            base_uom=str(exception_data["base_uom"]).strip(),
-            reason=str(exception_data["reason"]).strip(),
+            base_uom=base_uom,
+            reason=reason,
             status="OPEN",
         )
         db.add(exception)
         db.flush()
     else:
-        # Refresh quantities for the existing exception.
-        exception.ordered_qty = Decimal(str(exception_data["ordered_qty"]))
-        exception.accepted_qty = Decimal(str(exception_data["accepted_qty"]))
+        # Update the existing exception without creating a duplicate.
+        exception.po_number = po_number
+        exception.line_number = line_number
+        exception.location_id = location_id
+        exception.product_id = product_id
+        exception.ordered_qty = ordered_qty
+        exception.accepted_qty = accepted_qty
         exception.shortfall_qty = shortfall_qty
-        exception.reason = str(exception_data["reason"]).strip()
+        exception.base_uom = base_uom
+        exception.reason = reason
 
     task_key = f"TASK:{exception_key}"
 
@@ -98,10 +154,14 @@ def persist_exception_and_task(
         )
         db.add(task)
     else:
-        # Update the current assignment without creating another task.
-        task.assignee_id = assignee_id
-        task.assignee_role = assignee_role
-        task.assignment_reason = assignment_reason
+        # Preserve the task's workflow status during ingestion reruns.
+        # Do not overwrite an existing assignment if the task is
+        # already being worked on or has reached a terminal state.
+        if task.status == "OPEN":
+            task.assignee_id = assignee_id
+            task.assignee_role = assignee_role
+            task.assignment_reason = assignment_reason
 
     db.flush()
+
     return exception, task
